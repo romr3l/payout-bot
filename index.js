@@ -41,7 +41,36 @@ const IDS = {
   details: "payout_details"
 };
 
-function controls(disabled=false) {
+// ---------- Date helpers (M/D/YYYY) ----------
+function fmtMDY(d) {
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const y = d.getFullYear();
+  return `${m}/${day}/${y}`;
+}
+
+function normalizeDate(input) {
+  const mdy = /^\d{1,2}\/\d{1,2}\/\d{4}$/;   // 8/19/2025 or 08/19/2025
+  const iso = /^\d{4}-\d{2}-\d{2}$/;         // 2025-08-19
+
+  if (mdy.test(input)) {
+    const [m, d, y] = input.split("/").map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (dt && dt.getFullYear() === y && dt.getMonth() + 1 === m && dt.getDate() === d) {
+      return `${m}/${d}/${y}`;
+    }
+    return null;
+  }
+  if (iso.test(input)) {
+    const [y, mm, dd] = input.split("-").map(Number);
+    const dt = new Date(y, mm - 1, dd);
+    return isNaN(dt) ? null : fmtMDY(dt);
+  }
+  const dt = new Date(input);
+  return isNaN(dt) ? null : fmtMDY(dt);
+}
+
+function controls(disabled = false) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(BUTTONS.PAY).setLabel("Pay").setStyle(ButtonStyle.Success).setDisabled(disabled),
     new ButtonBuilder().setCustomId(BUTTONS.COOLDOWN).setLabel("Cooldown").setStyle(ButtonStyle.Secondary).setDisabled(disabled),
@@ -50,7 +79,7 @@ function controls(disabled=false) {
 }
 
 function statusBadge(s) {
-  return ({ OPEN:"🟡 Pending", PAID:"🟢 Paid", DECLINED:"🔴 Declined", COOLDOWN:"🟣 Cooldown" })[s] ?? s;
+  return ({ OPEN: "🟡 Pending", PAID: "🟢 Paid", DECLINED: "🔴 Declined", COOLDOWN: "🟣 Cooldown" })[s] ?? s;
 }
 
 function payoutEmbed(row, extra) {
@@ -83,7 +112,7 @@ client.on(Events.InteractionCreate, async (i) => {
   const canUse = i.member.permissions.has(PermissionsBitField.Flags.ManageGuild);
   if (!canUse) return i.reply({ content: "You need **Manage Server** to use this.", ephemeral: true });
 
-  const today = new Date().toISOString().slice(0,10);
+  const today = fmtMDY(new Date());  // M/D/YYYY by default
 
   const modal = new ModalBuilder().setCustomId(MODAL_ID).setTitle("Payout Request");
 
@@ -94,7 +123,7 @@ client.on(Events.InteractionCreate, async (i) => {
     .setPlaceholder("e.g. 100");
   const date = new TextInputBuilder()
     .setCustomId(IDS.date).setLabel("Date").setStyle(TextInputStyle.Short).setRequired(true)
-    .setValue(today).setPlaceholder("YYYY-MM-DD");
+    .setValue(today).setPlaceholder("MM/DD/YYYY");
   const details = new TextInputBuilder()
     .setCustomId(IDS.details).setLabel("Event Details").setStyle(TextInputStyle.Paragraph).setRequired(true);
 
@@ -114,7 +143,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
   const robloxUser = i.fields.getTextInputValue(IDS.username).trim();
   const amountRaw  = i.fields.getTextInputValue(IDS.amount).trim();
-  const date       = i.fields.getTextInputValue(IDS.date).trim();
+  const dateRaw    = i.fields.getTextInputValue(IDS.date).trim();
   const details    = i.fields.getTextInputValue(IDS.details).trim();
 
   const amount = parseInt(amountRaw, 10);
@@ -122,12 +151,17 @@ client.on(Events.InteractionCreate, async (i) => {
     return i.reply({ content: "Robux Amount must be a positive number.", ephemeral: true });
   }
 
-  const logsChan = await i.guild.channels.fetch(process.env.PAYOUT_LOGS_CHANNEL_ID).catch(()=>null);
+  const dateNorm = normalizeDate(dateRaw);
+  if (!dateNorm) {
+    return i.reply({ content: "Please enter Date as **MM/DD/YYYY** (e.g., 8/19/2025).", ephemeral: true });
+  }
+
+  const logsChan = await i.guild.channels.fetch(process.env.PAYOUT_LOGS_CHANNEL_ID).catch(() => null);
   if (!logsChan || logsChan.type !== ChannelType.GuildText)
     return i.reply({ content: "PAYOUT_LOGS_CHANNEL_ID is invalid.", ephemeral: true });
 
   const now = Date.now();
-  const reason = `Date: ${date}\nEvent: ${details}`;
+  const reason = `Date: ${dateNorm}\nEvent: ${details}`;
 
   const insert = db.prepare(`
     INSERT INTO payouts (robloxUser, amount, reason, status, requestedById, createdAt, updatedAt)
@@ -136,7 +170,7 @@ client.on(Events.InteractionCreate, async (i) => {
   const result = insert.run(robloxUser, amount, reason, i.user.id, now, now);
   const row = db.prepare("SELECT * FROM payouts WHERE id=?").get(result.lastInsertRowid);
 
-  await postCard(row, logsChan, { date, details });
+  await postCard(row, logsChan, { date: dateNorm, details });
   await i.reply({ content: `Payout request **#${row.id}** posted in <#${logsChan.id}>.`, ephemeral: true });
 });
 
@@ -155,7 +189,7 @@ client.on(Events.InteractionCreate, async (i) => {
   } else if (i.customId === BUTTONS.DECLINE) {
     db.prepare("UPDATE payouts SET status='DECLINED', actedById=?, updatedAt=? WHERE id=?").run(i.user.id, now, row.id);
   } else if (i.customId === BUTTONS.COOLDOWN) {
-    const dueAt = now + 14*24*60*60*1000;
+    const dueAt = now + 14 * 24 * 60 * 60 * 1000;
     db.prepare("UPDATE payouts SET status='COOLDOWN', dueAt=?, actedById=?, updatedAt=? WHERE id=?")
       .run(dueAt, i.user.id, now, row.id);
   }
@@ -163,8 +197,8 @@ client.on(Events.InteractionCreate, async (i) => {
   const updated = db.prepare("SELECT * FROM payouts WHERE id=?").get(row.id);
   const [dateLine, eventLine] = (updated.reason || "").split("\n");
   const extra = {
-    date: dateLine?.replace("Date: ","") || undefined,
-    details: eventLine?.replace("Event: ","") || undefined
+    date: dateLine?.replace("Date: ", "") || undefined,
+    details: eventLine?.replace("Event: ", "") || undefined
   };
   await i.update({ embeds: [payoutEmbed(updated, extra)], components: [controls(updated.status !== "OPEN")] });
 
@@ -186,8 +220,8 @@ setInterval(async () => {
 
       const [dateLine, eventLine] = (refreshed.reason || "").split("\n");
       await postCard(refreshed, channel, {
-        date: dateLine?.replace("Date: ",""),
-        details: eventLine?.replace("Event: ","")
+        date: dateLine?.replace("Date: ", ""),
+        details: eventLine?.replace("Event: ", "")
       });
     } catch (e) { console.error("Cooldown repost failed:", e.message); }
   }
