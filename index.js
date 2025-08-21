@@ -41,6 +41,21 @@ const IDS = {
   details: "payout_details"
 };
 
+// ---- Permissions: allow specific roles via env (comma-separated IDs)
+const ALLOWED_ROLE_IDS = (process.env.ALLOWED_ROLE_IDS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function hasPayoutPermission(member) {
+  if (!member) return false;
+  // Keep admins with Manage Server as a fallback:
+  if (member.permissions?.has(PermissionsBitField.Flags.ManageGuild)) return true;
+  if (!ALLOWED_ROLE_IDS.length) return false;
+  const roles = member.roles?.cache ?? new Map();
+  return ALLOWED_ROLE_IDS.some(id => roles.has(id));
+}
+
 // ---------- Date helpers (M/D/YYYY) ----------
 function fmtMDY(d) {
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -109,10 +124,11 @@ client.once(Events.ClientReady, c => console.log(`✔ Logged in as ${c.user.tag}
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isChatInputCommand() || i.commandName !== "payout") return;
 
-  const canUse = i.member.permissions.has(PermissionsBitField.Flags.ManageGuild);
-  if (!canUse) return i.reply({ content: "You need **Manage Server** to use this.", ephemeral: true });
+  if (!hasPayoutPermission(i.member)) {
+    return i.reply({ content: "You don’t have permission to use this.", ephemeral: true });
+  }
 
-  const today = fmtMDY(new Date());  // M/D/YYYY by default
+  const today = fmtMDY(new Date());  // MM/DD/YYYY by default
 
   const modal = new ModalBuilder().setCustomId(MODAL_ID).setTitle("Payout Request");
 
@@ -140,6 +156,10 @@ client.on(Events.InteractionCreate, async (i) => {
 // ---------- modal submit -> create card ----------
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isModalSubmit() || i.customId !== MODAL_ID) return;
+
+  if (!hasPayoutPermission(i.member)) {
+    return i.reply({ content: "You don’t have permission to submit this form.", ephemeral: true });
+  }
 
   const robloxUser = i.fields.getTextInputValue(IDS.username).trim();
   const amountRaw  = i.fields.getTextInputValue(IDS.amount).trim();
@@ -177,6 +197,11 @@ client.on(Events.InteractionCreate, async (i) => {
 // ---------- button handlers ----------
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isButton()) return;
+
+  if (!hasPayoutPermission(i.member)) {
+    return i.reply({ content: "You don’t have permission to act on payouts.", ephemeral: true });
+  }
+
   const values = Object.values(BUTTONS);
   if (!values.includes(i.customId)) return;
 
