@@ -198,12 +198,13 @@ client.on(Events.InteractionCreate, async (i) => {
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isButton()) return;
 
+  // ✅ Ignore non-payout buttons FIRST
+  if (!i.customId.startsWith('payout:')) return;
+
+  // Now do the permission check
   if (!hasPayoutPermission(i.member)) {
     return i.reply({ content: "You don’t have permission to act on payouts.", ephemeral: true });
   }
-
-  const values = Object.values(BUTTONS);
-  if (!values.includes(i.customId)) return;
 
   const row = db.prepare("SELECT * FROM payouts WHERE messageId=?").get(i.message.id);
   if (!row) return i.reply({ content: "Record not found (maybe already handled).", ephemeral: true });
