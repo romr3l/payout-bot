@@ -1,29 +1,120 @@
+// index.js (Postgres version)
 import "dotenv/config";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client,
   EmbedBuilder, Events, GatewayIntentBits, ModalBuilder, PermissionsBitField,
   TextInputBuilder, TextInputStyle
 } from "discord.js";
-import Database from "better-sqlite3";
+import pkg from "pg";
 
-// ---------- DB ----------
-const db = new Database("payouts.db");
-db.pragma("journal_mode = wal");
-db.prepare(`
+// ---------- DB (Postgres) ----------
+const { Pool } = pkg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Heroku/Railway often require SSL; Railway's internal URL may not.
+  ssl: process.env.DATABASE_URL?.includes("sslmode=require")
+    ? { rejectUnauthorized: false }
+    : undefined,
+});
+
+// Create table + indexes
+await pool.query(`
 CREATE TABLE IF NOT EXISTS payouts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  messageId TEXT,
-  channelId TEXT,
-  robloxUser TEXT,
-  amount INTEGER,
-  reason TEXT,
-  status TEXT,
-  requestedById TEXT,
-  actedById TEXT,
-  createdAt INTEGER,
-  updatedAt INTEGER,
-  dueAt INTEGER
-)`).run();
+  id              SERIAL PRIMARY KEY,
+  message_id      TEXT,
+  channel_id      TEXT,
+  roblox_user     TEXT NOT NULL,
+  amount          INTEGER NOT NULL,
+  reason          TEXT,
+  status          TEXT NOT NULL,
+  requested_by_id TEXT,
+  acted_by_id     TEXT,
+  created_at      BIGINT NOT NULL,
+  updated_at      BIGINT NOT NULL,
+  due_at          BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_payouts_message_id ON payouts (message_id);
+CREATE INDEX IF NOT EXISTS idx_payouts_status_due ON payouts (status, due_at);
+`);
+
+// Little helpers that always return camelCase like your old rows
+const mapRow = (r) => r && ({
+  id: r.id,
+  messageId: r.message_id,
+  channelId: r.channel_id,
+  robloxUser: r.roblox_user,
+  amount: r.amount,
+  reason: r.reason,
+  status: r.status,
+  requestedById: r.requested_by_id,
+  actedById: r.acted_by_id,
+  createdAt: Number(r.created_at),
+  updatedAt: Number(r.updated_at),
+  dueAt: r.due_at == null ? null : Number(r.due_at),
+});
+
+const DB = {
+  async insertPayout({ robloxUser, amount, reason, requestedById, now }) {
+    const { rows } = await pool.query(
+      `INSERT INTO payouts
+       (roblox_user, amount, reason, status, requested_by_id, created_at, updated_at)
+       VALUES ($1, $2, $3, 'OPEN', $4, $5, $5)
+       RETURNING *`,
+      [robloxUser, amount, reason, requestedById, now]
+    );
+    return mapRow(rows[0]);
+  },
+
+  async setMessageLink({ id, messageId, channelId }) {
+    await pool.query(
+      `UPDATE payouts SET message_id=$1, channel_id=$2 WHERE id=$3`,
+      [messageId, channelId, id]
+    );
+  },
+
+  async getByMessageId(messageId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM payouts WHERE message_id=$1`,
+      [messageId]
+    );
+    return mapRow(rows[0] || null);
+  },
+
+  async getById(id) {
+    const { rows } = await pool.query(`SELECT * FROM payouts WHERE id=$1`, [id]);
+    return mapRow(rows[0] || null);
+  },
+
+  async updateStatus({ id, status, actedById, now, dueAt = null }) {
+    await pool.query(
+      `UPDATE payouts
+       SET status=$1, acted_by_id=$2, updated_at=$3, due_at=$4
+       WHERE id=$5`,
+      [status, actedById, now, dueAt, id]
+    );
+    return this.getById(id);
+  },
+
+  async getDueCooldowns(now) {
+    const { rows } = await pool.query(
+      `SELECT * FROM payouts
+       WHERE status='COOLDOWN' AND due_at IS NOT NULL AND due_at <= $1`,
+      [now]
+    );
+    return rows.map(mapRow);
+  },
+
+  async reopenAndDetach({ id, channelId, now }) {
+    await pool.query(
+      `UPDATE payouts
+       SET status='OPEN', message_id=NULL, channel_id=$1, updated_at=$2, due_at=NULL
+       WHERE id=$3`,
+      [channelId, now, id]
+    );
+    return this.getById(id);
+  },
+};
 
 // ---------- Client ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -49,7 +140,6 @@ const ALLOWED_ROLE_IDS = (process.env.ALLOWED_ROLE_IDS || "")
 
 function hasPayoutPermission(member) {
   if (!member) return false;
-  // Keep admins with Manage Server as a fallback:
   if (member.permissions?.has(PermissionsBitField.Flags.ManageGuild)) return true;
   if (!ALLOWED_ROLE_IDS.length) return false;
   const roles = member.roles?.cache ?? new Map();
@@ -65,8 +155,8 @@ function fmtMDY(d) {
 }
 
 function normalizeDate(input) {
-  const mdy = /^\d{1,2}\/\d{1,2}\/\d{4}$/;   // 8/19/2025 or 08/19/2025
-  const iso = /^\d{4}-\d{2}-\d{2}$/;         // 2025-08-19
+  const mdy = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
 
   if (mdy.test(input)) {
     const [m, d, y] = input.split("/").map(Number);
@@ -114,7 +204,7 @@ function payoutEmbed(row, extra) {
 
 async function postCard(row, channel, extra) {
   const msg = await channel.send({ embeds: [payoutEmbed(row, extra)], components: [controls()] });
-  db.prepare("UPDATE payouts SET messageId=?, channelId=? WHERE id=?").run(msg.id, channel.id, row.id);
+  await DB.setMessageLink({ id: row.id, messageId: msg.id, channelId: channel.id });
   return msg;
 }
 
@@ -183,12 +273,13 @@ client.on(Events.InteractionCreate, async (i) => {
   const now = Date.now();
   const reason = `Date: ${dateNorm}\nEvent: ${details}`;
 
-  const insert = db.prepare(`
-    INSERT INTO payouts (robloxUser, amount, reason, status, requestedById, createdAt, updatedAt)
-    VALUES (?, ?, ?, 'OPEN', ?, ?, ?)
-  `);
-  const result = insert.run(robloxUser, amount, reason, i.user.id, now, now);
-  const row = db.prepare("SELECT * FROM payouts WHERE id=?").get(result.lastInsertRowid);
+  const row = await DB.insertPayout({
+    robloxUser,
+    amount,
+    reason,
+    requestedById: i.user.id,
+    now
+  });
 
   await postCard(row, logsChan, { date: dateNorm, details });
   await i.reply({ content: `Payout request **#${row.id}** posted in <#${logsChan.id}>.`, ephemeral: true });
@@ -206,21 +297,20 @@ client.on(Events.InteractionCreate, async (i) => {
     return i.reply({ content: "You don’t have permission to act on payouts.", ephemeral: true });
   }
 
-  const row = db.prepare("SELECT * FROM payouts WHERE messageId=?").get(i.message.id);
+  const row = await DB.getByMessageId(i.message.id);
   if (!row) return i.reply({ content: "Record not found (maybe already handled).", ephemeral: true });
 
   const now = Date.now();
+  let updated;
   if (i.customId === BUTTONS.PAY) {
-    db.prepare("UPDATE payouts SET status='PAID', actedById=?, updatedAt=? WHERE id=?").run(i.user.id, now, row.id);
+    updated = await DB.updateStatus({ id: row.id, status: "PAID", actedById: i.user.id, now });
   } else if (i.customId === BUTTONS.DECLINE) {
-    db.prepare("UPDATE payouts SET status='DECLINED', actedById=?, updatedAt=? WHERE id=?").run(i.user.id, now, row.id);
+    updated = await DB.updateStatus({ id: row.id, status: "DECLINED", actedById: i.user.id, now });
   } else if (i.customId === BUTTONS.COOLDOWN) {
     const dueAt = now + 14 * 24 * 60 * 60 * 1000;
-    db.prepare("UPDATE payouts SET status='COOLDOWN', dueAt=?, actedById=?, updatedAt=? WHERE id=?")
-      .run(dueAt, i.user.id, now, row.id);
+    updated = await DB.updateStatus({ id: row.id, status: "COOLDOWN", actedById: i.user.id, now, dueAt });
   }
 
-  const updated = db.prepare("SELECT * FROM payouts WHERE id=?").get(row.id);
   const [dateLine, eventLine] = (updated.reason || "").split("\n");
   const extra = {
     date: dateLine?.replace("Date: ", "") || undefined,
@@ -236,13 +326,12 @@ client.on(Events.InteractionCreate, async (i) => {
 
 // ---------- cooldown worker ----------
 setInterval(async () => {
-  const due = db.prepare("SELECT * FROM payouts WHERE status='COOLDOWN' AND dueAt IS NOT NULL AND dueAt <= ?").all(Date.now());
+  const due = await DB.getDueCooldowns(Date.now());
   for (const row of due) {
     try {
       const channelId = row.channelId || process.env.PAYOUT_LOGS_CHANNEL_ID;
       const channel = await client.channels.fetch(channelId);
-      db.prepare("UPDATE payouts SET status='OPEN', messageId=NULL, channelId=?, updatedAt=?, dueAt=NULL").run(channel.id, Date.now(), row.id);
-      const refreshed = db.prepare("SELECT * FROM payouts WHERE id=?").get(row.id);
+      const refreshed = await DB.reopenAndDetach({ id: row.id, channelId, now: Date.now() });
 
       const [dateLine, eventLine] = (refreshed.reason || "").split("\n");
       await postCard(refreshed, channel, {
@@ -254,3 +343,4 @@ setInterval(async () => {
 }, 60_000);
 
 client.login(process.env.DISCORD_TOKEN);
+
